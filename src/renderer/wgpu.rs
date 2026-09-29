@@ -224,7 +224,18 @@ pub struct Image {
 struct CachedPipeline {
     pipeline: wgpu::RenderPipeline,
     accessed: bool,
+    /// The flush that last used this pipeline.
+    last_used: u64,
 }
+
+/// How many flushes a pipeline may go unused before it is dropped.
+///
+/// Keeping only what the last flush used re-creates pipelines whenever consecutive flushes
+/// need different ones. A host that draws between two flushes of the same frame (Slint does,
+/// when a rendering notifier is set: it flushes the clear, calls the notifier, then flushes
+/// the scene) then rebuilds every pipeline of both flushes on every frame, which on a Vulkan
+/// driver is milliseconds per frame.
+const PIPELINE_IDLE_FLUSHES: u64 = 240;
 
 /// WGPU renderer.
 #[derive(Debug)]
@@ -244,6 +255,8 @@ pub struct WGPURenderer {
     viewport_bind_group_layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     pipeline_cache: Rc<RefCell<HashMap<PipelineState, CachedPipeline>>>,
+    /// Flushes rendered so far, the clock `CachedPipeline::last_used` is read against.
+    flushes: u64,
 }
 
 /// Rasterizes an image element into an offscreen canvas at the given size.
@@ -431,6 +444,7 @@ impl WGPURenderer {
             viewport_bind_group_layout,
             pipeline_layout,
             pipeline_cache: Default::default(),
+            flushes: 0,
         }
     }
 }
@@ -616,9 +630,16 @@ impl Renderer for WGPURenderer {
 
         let command_buffer = encoder.finish();
 
+        self.flushes += 1;
+        let flush = self.flushes;
         self.pipeline_cache
             .borrow_mut()
-            .retain(|_, cached_pipeline| std::mem::replace(&mut cached_pipeline.accessed, false));
+            .retain(|_, cached_pipeline| {
+                if std::mem::replace(&mut cached_pipeline.accessed, false) {
+                    cached_pipeline.last_used = flush;
+                }
+                flush - cached_pipeline.last_used <= PIPELINE_IDLE_FLUSHES
+            });
 
         Some(command_buffer)
     }
@@ -1806,6 +1827,7 @@ impl CommandToPipelineAndBindGroupMapper {
             CachedPipeline {
                 pipeline,
                 accessed: false,
+                last_used: 0,
             }
         });
 
